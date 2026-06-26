@@ -4,17 +4,20 @@ import type { Queue } from 'bull';
 import { PrismaService } from '../prisma/prisma.service';
 import { QUEUE_EMAIL } from '../queue/queue.constants';
 import type { EmailJobData } from './email.processor';
+import { maskEmail } from './email.utils';
 import {
   donationReceivedTemplate,
   milestoneUnlockedTemplate,
   campaignUpdateTemplate,
+  campaignSuspensionTemplate,
 } from './email-templates';
 
 export interface SuspensionEmailPayload {
-  toEmail: string;
+  creatorId: string;
   campaignId: string;
   campaignTitle: string;
   reason: string;
+  supportEmail?: string;
 }
 
 export interface DonationReceivedPayload {
@@ -112,7 +115,7 @@ export class NotificationsService {
     };
 
     await this.emailQueue.add('send-email', jobData);
-    this.logger.log(`Queued donation received email to ${payload.toEmail}`);
+    this.logger.log(`Queued donation received email to ${maskEmail(payload.toEmail)}`);
   }
 
   /** Queue a milestone unlocked email via Bull for async processing */
@@ -135,7 +138,7 @@ export class NotificationsService {
     };
 
     await this.emailQueue.add('send-email', jobData);
-    this.logger.log(`Queued milestone unlocked email to ${payload.toEmail}`);
+    this.logger.log(`Queued milestone unlocked email to ${maskEmail(payload.toEmail)}`);
   }
 
   /** Queue a campaign update email via Bull for async processing */
@@ -157,25 +160,73 @@ export class NotificationsService {
     };
 
     await this.emailQueue.add('send-email', jobData);
-    this.logger.log(`Queued campaign update email to ${payload.toEmail}`);
+    this.logger.log(`Queued campaign update email to ${maskEmail(payload.toEmail)}`);
   }
 
   /**
-   * Sends a suspension notice to the campaign creator (synchronous logging).
-   * Currently logged; replace with real mailer call in production.
+   * Sends a campaign suspension email to the creator and creates an in-app notification.
+   * Queues the email via Bull for async processing.
+   * @throws Error if user not found or email queueing fails
    */
   async sendCampaignSuspensionEmail(
     payload: SuspensionEmailPayload,
   ): Promise<void> {
+    // Fetch the real user email from the database
+    const creator = await this.prisma.user.findUnique({
+      where: { id: payload.creatorId },
+      select: { id: true, email: true, displayName: true },
+    });
+
+    if (!creator) {
+      throw new Error(`Creator with ID ${payload.creatorId} not found`);
+    }
+
+    if (!creator.email) {
+      throw new Error(
+        `Creator ${payload.creatorId} has no email address configured`,
+      );
+    }
+
+    const supportEmail = payload.supportEmail || 'support@orbitchain.io';
+    const template = campaignSuspensionTemplate;
+    const html = template.html({
+      campaignTitle: payload.campaignTitle,
+      reason: payload.reason,
+      supportEmail,
+    });
+
+    // Queue the email via Bull
+    const jobData: EmailJobData = {
+      to: creator.email,
+      subject: template.subject,
+      html,
+      // No preferenceKey - suspension emails are critical and bypass preferences
+    };
+
+    await this.emailQueue.add('send-email', jobData);
     this.logger.log(
-      `[EMAIL] To: ${payload.toEmail} | Subject: Your campaign "${payload.campaignTitle}" has been suspended | Reason: ${payload.reason}`,
+      `Queued campaign suspension email to ${creator.email} for campaign ${payload.campaignId}`,
     );
-    // TODO: replace with real mailer call, e.g.:
-    // await this.emailService.send({
-    //   to: payload.toEmail,
-    //   subject: `Your campaign "${payload.campaignTitle}" has been suspended`,
-    //   html: `...`,
-    // });
+
+    // Create in-app notification
+    await this.prisma.notification.create({
+      data: {
+        userId: payload.creatorId,
+        type: 'CAMPAIGN_UPDATED', // Using existing enum value; consider adding CAMPAIGN_SUSPENDED
+        title: 'Campaign Suspended',
+        message: `Your campaign "${payload.campaignTitle}" has been suspended. Reason: ${payload.reason}`,
+        relatedId: payload.campaignId,
+        isRead: false,
+      },
+    });
+
+    this.logger.log(
+
+      `[EMAIL] To: ${maskEmail(payload.toEmail)} | Subject: Your campaign "${payload.campaignTitle}" has been suspended | Reason: ${payload.reason}`,
+
+      `Created in-app notification for creator ${payload.creatorId} about campaign ${payload.campaignId} suspension`,
+
+    );
   }
 
   /**
